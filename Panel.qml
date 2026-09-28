@@ -23,6 +23,66 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   // GPU state
+  property var automationState: ({})
+  property string automationOutput: ""
+  property string statusGpuId: ""
+
+  function acceptAutomationState(result) {
+    var old = root.automationState
+    for (var key of ["capabilities", "profiles", "config"]) {
+      if (old[key] && JSON.stringify(old[key]) === JSON.stringify(result[key])) result[key] = old[key]
+    }
+    root.automationState = result
+  }
+
+  function pollAutomation() {
+    if (!currentGpu.id || currentGpu.vendor !== "NVIDIA" || automationStatusProc.running || automationProc.running) return
+    root.statusGpuId = currentGpu.id
+    automationStatusProc.command = ["/usr/bin/python3", Qt.resolvedUrl("scripts/automation.py").toString().replace(/^file:\/\//, ""), JSON.stringify({op: "status", gpu: currentGpu.id})]
+    automationStatusProc.running = true
+  }
+
+  function sendAutomation(request) {
+    if (root.controlBusy || !currentGpu.id) return
+    request.gpu = currentGpu.id
+    root.pendingAction = request.op
+    root.automationOutput = ""
+    root.showNotice("Applying " + request.op + "…")
+    automationProc.command = ["/usr/bin/python3", Qt.resolvedUrl("scripts/automation.py").toString().replace(/^file:\/\//, ""), JSON.stringify(request)]
+    automationProc.running = true
+  }
+
+  Timer { interval: 2000; running: root.opened; repeat: true; onTriggered: root.pollAutomation() }
+  Process {
+    id: automationStatusProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var result = JSON.parse(text)
+          if (result.status === "success" && root.statusGpuId === currentGpu.id) root.acceptAutomationState(result)
+        } catch (error) { console.log("OmaGPU controller status:", error) }
+      }
+    }
+  }
+  Process {
+    id: automationProc
+    stdout: StdioCollector { onStreamFinished: root.automationOutput = text }
+    onExited: function(code) {
+      Qt.callLater(function() {
+        try {
+          var result = JSON.parse(root.automationOutput)
+          if (result.status === "success") {
+            root.acceptAutomationState(result)
+            root.showNotice("Applied " + root.pendingAction)
+          } else root.showNotice(result.message || "Controller action failed")
+        } catch (error) { root.showNotice("Controller did not respond") }
+        root.pendingAction = ""
+        root.refresh()
+        root.pollAutomation()
+      })
+    }
+  }
+
   property var gpus: []
   property int selectedGpuIndex: 0
   readonly property var currentGpu: (gpus && gpus.length > selectedGpuIndex) ? gpus[selectedGpuIndex] : ({})
@@ -46,7 +106,7 @@ Panel {
   property string controlError: ""
   property string pendingGpuId: ""
   property var lastApplied: ({})
-  readonly property bool controlBusy: controlProc.running || pendingAction !== ""
+  readonly property bool controlBusy: controlProc.running || automationProc.running || pendingAction !== ""
   readonly property var powerLimits: currentGpu.powerLimits || ({})
   readonly property bool hasPowerRange: powerLimits.min !== undefined && powerLimits.max > powerLimits.min
   readonly property bool canSetPower: hasPowerRange && currentGpu.supportsPowerLimit === true
@@ -59,6 +119,12 @@ Panel {
 
   function runControl(action, value, label) {
     if (controlBusy || !currentGpu || !currentGpu.id) return
+    if (currentGpu.supportsAutomation) {
+      var keys = {"--set-fan": "fan", "--set-power-limit": "power", "--set-gpu-clock": "graphics", "--set-memory-clock": "memory"}
+      if (action === "--set-power-profile") root.sendAutomation({op: "legacy-profile", value: value})
+      else root.sendAutomation({op: "manual", key: keys[action], value: value === "auto" || value === "default" ? value : Number(value)})
+      return
+    }
     root.pendingAction = label
     root.pendingGpuId = currentGpu.id
     root.controlOutput = ""
@@ -87,13 +153,15 @@ Panel {
         ? currentGpu.thermal.fanPwmPercent : 50
   }
 
-  onSelectedGpuIndexChanged: Qt.callLater(root.syncSliders)
+  onSelectedGpuIndexChanged: { root.automationState = ({}); Qt.callLater(root.syncSliders); Qt.callLater(root.pollAutomation) }
 
   readonly property var tabList: [
     { label: "Telemetry", key: "telemetry" },
     { label: "Tuning & Power", key: "tuning" },
     { label: "Fan Control", key: "fans" },
-    { label: "Hardware & Stack", key: "hardware" }
+    { label: "Hardware & Stack", key: "hardware" },
+    { label: "Profiles & Clocks", key: "profiles" },
+    { label: "Automation", key: "automation" }
   ]
 
   function copyToClipboard(text) {
@@ -104,7 +172,7 @@ Panel {
   }
 
   function selectGpu(delta) {
-    if (!gpus || gpus.length <= 1) return
+    if (root.controlBusy || !gpus || gpus.length <= 1) return
     var nextIndex = (root.selectedGpuIndex + delta) % root.gpus.length
     if (nextIndex < 0) nextIndex += root.gpus.length
     root.selectedGpuIndex = nextIndex
@@ -234,7 +302,10 @@ Panel {
 
   onActiveTabChanged: if (panelFlick) panelFlick.contentY = 0
 
-  Component.onCompleted: root.refresh()
+  Component.onCompleted: {
+    Quickshell.execDetached(["/usr/bin/python3", Qt.resolvedUrl("scripts/automation.py").toString().replace(/^file:\/\//, ""), "--serve"])
+    root.refresh()
+  }
 
   KeyboardPanel {
     id: panel
@@ -261,7 +332,7 @@ Panel {
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
         else if (t === "p" || t === "P") { root.paused = !root.paused; if (!root.paused) root.refresh() }
-        else if (["1", "2", "3", "4"].indexOf(t) >= 0) root.activeTab = root.tabList[Number(t) - 1].key
+        else if (["1", "2", "3", "4", "5", "6"].indexOf(t) >= 0) root.activeTab = root.tabList[Number(t) - 1].key
         else if (t === "[") root.selectGpu(-1)
         else if (t === "]") root.selectGpu(1)
       }
@@ -468,7 +539,7 @@ Panel {
           }
 
           // ------------------ NAVIGATION TABS ------------------
-          Row {
+          Flow {
             width: parent.width
             spacing: Style.space(6)
 
@@ -1332,11 +1403,18 @@ Panel {
             }
           }
 
+          AdvancedControls {
+            width: parent.width
+            host: root
+            mode: root.activeTab
+            visible: root.activeTab === "profiles" || root.activeTab === "automation"
+          }
+
           // ------------------ FOOTER ------------------
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "1–4: tabs · R: refresh · P: pause" + (root.gpus.length > 1 ? " · [ / ]: GPU" : "")
+            text: "1–6: tabs · R: refresh · P: pause" + (root.gpus.length > 1 ? " · [ / ]: GPU" : "")
             color: Qt.darker(root.dim, 1.3)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

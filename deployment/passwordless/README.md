@@ -59,3 +59,53 @@ progress/error feedback. Power-limit actions stay disabled until the installed
 helper reports `powerLimit: true` from `--check`; installing a newer plugin
 alone does not expand root privileges. The updated helper requires explicit
 approval before installation. Current GPU settings are never changed on open.
+
+## Profiles, clocks and automation
+
+The Profiles & Clocks tab provides supported core caps, supported memory clock
+locks, saved full profiles, and timed overrides. Automation provides fan curves,
+per-application profiles, temperature notifications, and a latched thermal
+fallback. The controller uses NVIDIA's reported frequency and power ranges;
+these controls do not change voltage or apply frequency offsets.
+
+Install the updated root-owned helper using the commands above after approving
+the new privileged capabilities. `--check` then reports `advancedControls: true`.
+The PolicyKit rule remains limited to this helper and the active local user.
+The root watchdog accepts only a GPU identifier and validated restore/cooling/
+temperature settings; it never loads the writable plugin or executes shell input.
+
+The plugin starts one user-owned controller from the desktop session. A lock and
+private Unix socket under `$XDG_RUNTIME_DIR/omagpu-automation/` prevent duplicate
+controllers and reject other user IDs. Configuration lives in
+`~/.config/omarchy/omagpu-controls.json` (mode 0600). Automation runs even while
+the panel is closed. Profiles, app rules, curve points and thresholds persist;
+all automation starts disabled when the controller process starts. No GPU
+settings change just by opening the panel or installing the update.
+
+Apply a complete saved profile before starting a timed override or app rules.
+This establishes a known restore point: NVIDIA does not expose getters for
+previous locked-clock ranges. External tuning performed after that point is not
+tracked. A manual action stops app overrides and restores a pending timer first.
+App matching uses exact executable names or absolute paths, only for processes
+owned by the desktop user; the first matching rule wins. App rules, fan curves,
+and timed overrides are mutually exclusive. Thermal fallback has priority over
+all of them and requires acknowledgement after cooling 5°C below its threshold.
+
+Fan curves must use increasing temperatures and nondecreasing fan percentages,
+ending at 100% by 85°C. Updates have a 3-point duty deadband and 5-second minimum
+interval. Three missing temperature samples restore automatic cooling. Driver
+minimum fan duty still applies. A root-owned watchdog restores cooling/previous
+settings on controller EOF, missed heartbeats, or timer expiry. Heartbeats come
+from controller progress, not a separate keepalive thread. Thermal fallback
+uses independent temperature checks inside the watchdog; it restores automatic
+fans/clocks and the driver minimum power limit. It latches even if a driver
+reports partial recovery, and exposes the error for review. This supplements,
+and does not replace, the GPU's firmware thermal protections.
+
+Clock and fan support remains driver-dependent; rejected operations surface as
+errors. Profile application rolls back completed operations when a known prior
+profile exists; without a known prior profile, failures report uncertain state.
+Status notifications explain restoration failures instead of claiming success.
+
+References: [NVIDIA clock controls](https://docs.nvidia.com/deploy/nvidia-smi/)
+and [NVML device queries](https://docs.nvidia.com/deploy/nvml-api/api/group__nvmlDeviceQueries.html).

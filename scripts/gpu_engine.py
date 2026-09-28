@@ -158,13 +158,17 @@ def parse_nvidia_smi_output(raw_output):
     return gpus
 
 
-def power_control_available():
+def helper_capabilities():
     try:
         result = subprocess.run(["/usr/local/libexec/omagpu-control", "--check"],
                                 capture_output=True, text=True, timeout=2.0)
-        return result.returncode == 0 and json.loads(result.stdout).get("powerLimit") is True
+        return json.loads(result.stdout) if result.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, ValueError):
-        return False
+        return {}
+
+
+def power_control_available():
+    return helper_capabilities().get("powerLimit") is True
 
 
 def attach_power_limits(gpus, output):
@@ -207,9 +211,10 @@ def query_nvidia_gpus():
                     attach_power_limits(gpus, limits.stdout)
             except (OSError, subprocess.SubprocessError):
                 pass
-            available = power_control_available()
+            capabilities = helper_capabilities()
             for gpu in gpus:
-                gpu["supportsPowerLimit"] = available and "powerLimits" in gpu
+                gpu["supportsPowerLimit"] = capabilities.get("powerLimit") is True and "powerLimits" in gpu
+                gpu["supportsAutomation"] = capabilities.get("advancedControls") is True
             return gpus
     except (FileNotFoundError, subprocess.SubprocessError):
         pass

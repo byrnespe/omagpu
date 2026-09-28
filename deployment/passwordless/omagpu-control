@@ -7,6 +7,9 @@ import os
 import re
 import subprocess
 import sys
+import select
+import time
+import signal
 from pathlib import Path
 os.environ.clear()
 os.environ.update(PATH="/usr/bin", LANG="C.UTF-8")
@@ -158,15 +161,183 @@ def set_power_limit(target, value):
     return {"status": "success", "watts": watts, "method": "nvidia-smi"}
 
 
+def supported_clocks(target):
+    result = subprocess.run(["/usr/bin/nvidia-smi", "-i", target,
+        "--query-supported-clocks=memory,graphics", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=5)
+    pairs = []
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            row = [v.strip() for v in line.split(",")]
+            if len(row) == 2 and all(v.isdigit() for v in row):
+                pairs.append([int(row[0]), int(row[1])])
+    if not pairs:
+        raise ValueError("Driver does not expose supported clock settings")
+    return pairs
+
+
+def set_clock(target, kind, value):
+    reset, flag = ("-rgc", "-lgc") if kind == "graphics" else ("-rmc", "-lmc")
+    if value == "auto":
+        arguments = [reset]
+    else:
+        pairs = supported_clocks(target)
+        values = sorted({pair[1 if kind == "graphics" else 0] for pair in pairs})
+        clock = int(value)
+        if clock not in values:
+            raise ValueError("Choose a driver-supported clock frequency")
+        arguments = [flag, f"{values[0]},{clock}" if kind == "graphics" else f"{clock},{clock}"]
+    result = subprocess.run(["/usr/bin/nvidia-smi", "-i", target] + arguments,
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode:
+        return {"status": "error", "message": (result.stderr or result.stdout).strip()[:300]}
+    return {"status": "success", "clock": kind, "value": value}
+
+
+def validate_restore(settings):
+    if not isinstance(settings, dict) or set(settings) != {"graphics", "memory", "power", "fan"}:
+        raise ValueError("A complete restore profile is required")
+    for key, value in settings.items():
+        text = str(value)
+        if key in ("graphics", "memory"):
+            valid = text == "auto" or re.fullmatch(r"[0-9]{1,5}", text)
+        elif key == "power":
+            valid = text == "default" or re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,2})?", text)
+        else:
+            valid = text == "auto" or (re.fullmatch(r"[0-9]{1,3}", text) and 0 <= int(text) <= 255)
+        if not valid:
+            raise ValueError("Invalid restore value")
+    return settings
+
+
+def restore_controls(card, settings, cooling):
+    results = []
+    if settings:
+        for key, action in [("fan", "--set-fan"), ("graphics", "--set-gpu-clock"),
+                            ("memory", "--set-memory-clock"), ("power", "--set-power-limit")]:
+            try:
+                results.append(control([action, card, str(settings[key])]))
+            except Exception as exc:
+                results.append({"status": "error", "message": str(exc)})
+    if cooling:
+        try:
+            results.append(control(["--set-fan", card, "auto"]))
+        except Exception as exc:
+            results.append({"status": "error", "message": str(exc)})
+    return {"status": "success" if all(r.get("status") == "success" for r in results) else "error", "restored": results}
+
+
+def read_watchdog_message():
+    # Read only through the newline: TextIO buffering would hide a queued
+    # release from select(), causing an unwanted fallback on clean shutdown.
+    data = bytearray()
+    deadline = time.monotonic() + 2
+    while len(data) < 128:
+        ready, _, _ = select.select([sys.stdin], [], [], max(0, deadline - time.monotonic()))
+        if not ready:
+            return ""
+        byte = os.read(sys.stdin.fileno(), 1)
+        if not byte:
+            return ""
+        data.extend(byte)
+        if byte == b"\n":
+            return data.decode("ascii", errors="replace")
+    return ""
+
+
+def watchdog(card, spec):
+    """Restore on controller loss or deadline. No socket, shell, or user imports."""
+    if not re.fullmatch(r"nvidia[0-9]{1,3}", card) or os.geteuid() != 0:
+        raise ValueError("Watchdog requires a supported GPU and root")
+    if not isinstance(spec, dict) or set(spec) - {"restore", "cooling", "seconds", "thermal"}:
+        raise ValueError("Invalid watchdog settings")
+    settings = validate_restore(spec["restore"]) if spec.get("restore") else None
+    cooling = spec.get("cooling") is True
+    seconds = spec.get("seconds", 0)
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or not 0 <= seconds <= 86400:
+        raise ValueError("Watchdog duration must be 0–86400 seconds")
+    thermal = spec.get("thermal")
+    if thermal is not None and (type(thermal) is not int or not 50 <= thermal <= 95):
+        raise ValueError("Thermal threshold must be 50–95°C")
+    if not settings and not cooling and thermal is None:
+        raise ValueError("Watchdog needs a restore action")
+    sensor_errors = 0
+    deadline = time.monotonic() + seconds if seconds else float("inf")
+    restored = False
+    def restore():
+        nonlocal restored
+        if not restored:
+            restored = True
+            return restore_controls(card, settings, cooling)
+        return {"status": "success"}
+    def interrupted(*unused):
+        restore()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    print(json.dumps({"status": "ready"}), flush=True)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([sys.stdin], [], [], min(12, remaining))
+            if not ready:
+                break
+            message = read_watchdog_message()
+            if message == "release\n":
+                restored = True
+                return {"status": "success", "released": True}
+            if message != "heartbeat\n":
+                break
+            if thermal is not None:
+                try:
+                    reading = subprocess.run(["/usr/bin/nvidia-smi", "-i", nvidia_control_target(card),
+                        "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=3)
+                except (OSError, subprocess.SubprocessError):
+                    reading = None
+                try:
+                    if reading is None:
+                        raise ValueError("Temperature unavailable")
+                    temperature = float(reading.stdout.strip())
+                    if reading.returncode or not math.isfinite(temperature):
+                        raise ValueError("Temperature unavailable")
+                    sensor_errors = 0
+                except ValueError:
+                    temperature = thermal
+                    sensor_errors += 1
+                    if sensor_errors < 3:
+                        continue
+                if temperature >= thermal:
+                    try:
+                        minimum = subprocess.run(["/usr/bin/nvidia-smi", "-i", nvidia_control_target(card),
+                            "--query-gpu=power.min_limit", "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=3)
+                        power = minimum.stdout.strip() if minimum.returncode == 0 else "unavailable"
+                    except (OSError, subprocess.SubprocessError):
+                        power = "unavailable"  # Fail this field; never raise power while recovering.
+                    fallback = {"graphics": "auto", "memory": "auto", "power": power, "fan": "auto"}
+                    result = restore_controls(card, fallback, True)
+                    result["thermal"] = True
+                    restored = True
+                    return result
+        return restore()
+    finally:
+        restore()
+
+
 LEVELS = {"auto", "low", "high", "profile_peak", "manual", "profile_standard", "profile_min_sclk", "profile_min_mclk"}
 
 def control(args):
     if args == ["--check"]:
-        return {"status": "success", "euid": os.geteuid(), "helper": "omagpu-control", "powerLimit": True}
+        return {"status": "success", "euid": os.geteuid(), "helper": "omagpu-control", "powerLimit": True, "advancedControls": True}
+    if len(args) == 3 and args[0] == "--watchdog":
+        return watchdog(args[1], json.loads(args[2]))
     if len(args) != 3:
         raise ValueError("Expected an action, GPU ID, and value")
     action, card, value = args
-    if action not in {"--set-power-profile", "--set-fan", "--set-power-limit"}:
+    if action not in {"--set-power-profile", "--set-fan", "--set-power-limit", "--set-gpu-clock", "--set-memory-clock"}:
         raise ValueError("Unsupported action")
     if not re.fullmatch(r"(?:card|nvidia)[0-9]{1,3}", card):
         raise ValueError("Invalid GPU ID")
@@ -178,18 +349,23 @@ def control(args):
     if action == "--set-power-limit" and value != "default":
         if not re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,2})?", value):
             raise ValueError("Power limit must be a watt value or default")
+    if action in {"--set-gpu-clock", "--set-memory-clock"} and value != "auto":
+        if not re.fullmatch(r"[0-9]{1,5}", value):
+            raise ValueError("Clock must be auto or a supported frequency")
     if os.geteuid() != 0:
         raise PermissionError("Root privileges required")
     target = nvidia_control_target(card)
     if target:
+        if action in {"--set-gpu-clock", "--set-memory-clock"}:
+            return set_clock(target, "graphics" if action == "--set-gpu-clock" else "memory", value)
         if action == "--set-power-limit":
             return set_power_limit(target, value)
         if action == "--set-power-profile":
             return set_nvidia_performance(card, target, value)
         result = set_nvidia_fan(target, value)
         return result or {"status": "error", "message": "Driver denied fan control"}
-    if action == "--set-power-limit":
-        raise ValueError("Power limit controls currently require NVIDIA")
+    if action in {"--set-power-limit", "--set-gpu-clock", "--set-memory-clock"}:
+        raise ValueError("Clock and power limit controls currently require NVIDIA")
     if get_driver(card) != "amdgpu":
         raise ValueError("GPU does not expose supported controls")
     device = Path("/sys/class/drm") / card / "device"
