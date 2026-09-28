@@ -490,7 +490,7 @@ def run_self_pkexec(*args):
         return {"status": "error", "message": "Permission denied even as root"}
     try:
         res = subprocess.run(
-            ["pkexec", sys.executable, os.path.abspath(__file__)] + list(args),
+            ["/usr/bin/pkexec", "/usr/local/libexec/omagpu-control"] + list(args),
             capture_output=True,
             text=True,
             timeout=90
@@ -692,6 +692,9 @@ def set_fan_pwm(card_id, pwm_val):
 def main():
     if len(sys.argv) > 1:
         action = sys.argv[1]
+        if action in {"--set-power-profile", "--set-fan"}:
+            print(json.dumps(run_self_pkexec(*sys.argv[1:])))
+            return
         if action == "--set-power-profile" and len(sys.argv) > 3:
             card_id = sys.argv[2]
             level = sys.argv[3]

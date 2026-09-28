@@ -1,0 +1,9 @@
+// OmaGPU: only org's active local desktop session, only the bounded helper.
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.omarchy.omagpu.control" &&
+        action.lookup("program") === "/usr/local/libexec/omagpu-control" &&
+        action.lookup("user") === "root" &&
+        subject.user === "org" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

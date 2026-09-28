@@ -1,0 +1,188 @@
+#!/usr/bin/python3 -I
+"""Root-owned, bounded OmaGPU controls. No user code or shell commands."""
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+os.environ.clear()
+os.environ.update(PATH="/usr/bin", LANG="C.UTF-8")
+NVML_FAN_POLICY_MANUAL = 1
+NVML_ERR_NO_PERMISSION = 4
+
+def run_self_pkexec(*args):
+    return {"status": "error", "message": "Root privileges required"}
+
+def get_driver(card_id):
+    if card_id.startswith("nvidia"):
+        return "nvidia"
+    driver_link = Path(f"/sys/class/drm/{card_id}/device/driver")
+    return driver_link.resolve().name if driver_link.exists() else None
+
+def nvidia_control_target(card_id):
+    if card_id.startswith("nvidia"):
+        return re.sub(r"\D", "", card_id) or "0"
+    dev_path = Path(f"/sys/class/drm/{card_id}/device")
+    driver_link = dev_path / "driver"
+    if driver_link.exists() and driver_link.resolve().name == "nvidia":
+        return dev_path.resolve().name
+    return None
+
+def nvml_get_handle(lib, target):
+    handle = ctypes.c_void_p()
+    if target.isdigit():
+        rc = lib.nvmlDeviceGetHandleByIndex_v2(int(target), ctypes.byref(handle))
+    else:
+        rc = lib.nvmlDeviceGetHandleByPciBusId_v2(target.encode(), ctypes.byref(handle))
+    return handle if rc == 0 else None
+
+def set_nvidia_fan(target, pwm_val):
+    try:
+        lib = ctypes.CDLL("/usr/lib/libnvidia-ml.so.1")
+    except OSError:
+        return {"status": "error", "message": "libnvidia-ml.so.1 not found"}
+    if lib.nvmlInit_v2() != 0:
+        return {"status": "error", "message": "NVML init failed"}
+    try:
+        handle = nvml_get_handle(lib, target)
+        if handle is None:
+            return {"status": "error", "message": f"NVML device {target} not found"}
+        fan_count = ctypes.c_uint(0)
+        if lib.nvmlDeviceGetNumFans(handle, ctypes.byref(fan_count)) != 0 or fan_count.value == 0:
+            return {"status": "error", "message": "NVML reports no controllable fans"}
+
+        if pwm_val == "auto":
+            for fan in range(fan_count.value):
+                rc = lib.nvmlDeviceSetDefaultFanSpeed_v2(handle, fan)
+                if rc == NVML_ERR_NO_PERMISSION:
+                    return None
+                if rc != 0:
+                    return {"status": "error", "message": f"NVML error {rc} restoring fan {fan}"}
+            return {"status": "success", "mode": "auto", "method": "nvml"}
+
+        try:
+            pwm_num = max(0, min(255, int(pwm_val)))
+        except ValueError:
+            return {"status": "error", "message": f"Invalid PWM value: {pwm_val}"}
+        percent = round((pwm_num / 255.0) * 100)
+        min_pct = ctypes.c_uint(0)
+        max_pct = ctypes.c_uint(100)
+        if lib.nvmlDeviceGetMinMaxFanSpeed(handle, ctypes.byref(min_pct), ctypes.byref(max_pct)) == 0:
+            percent = max(min_pct.value, min(max_pct.value, percent))
+        for fan in range(fan_count.value):
+            lib.nvmlDeviceSetFanControlPolicy(handle, fan, NVML_FAN_POLICY_MANUAL)
+            rc = lib.nvmlDeviceSetFanSpeed_v2(handle, fan, percent)
+            if rc == NVML_ERR_NO_PERMISSION:
+                return None
+            if rc != 0:
+                return {"status": "error", "message": f"NVML error {rc} on fan {fan}"}
+        return {"status": "success", "pwm": pwm_num, "method": "nvml"}
+    finally:
+        lib.nvmlShutdown()
+
+def set_nvidia_performance(card_id, target, level):
+    if level not in {"auto", "high", "low", "profile_peak"}:
+        return {"status": "error", "message": f"{level} not supported on NVIDIA"}
+    if os.geteuid() != 0:
+        return run_self_pkexec("--set-power-profile", card_id, level)
+
+    def smi(*args):
+        return subprocess.run(["/usr/bin/nvidia-smi", "-i", target] + list(args), capture_output=True, text=True, timeout=5.0)
+
+    def query(fields):
+        res = smi(f"--query-gpu={fields}", "--format=csv,noheader,nounits")
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        return [v.strip() for v in res.stdout.strip().split(",")]
+
+    def watts(value):
+        return str(int(float(value)))
+
+    plan = []
+    if level == "auto":
+        plan = [["-rgc"], ["-rmc"]]
+        limits = query("power.default_limit")
+        if limits:
+            plan.append(["-pl", watts(limits[0])])
+    elif level in ("high", "profile_peak"):
+        clocks = query("clocks.max.graphics,clocks.max.memory")
+        if not clocks or len(clocks) < 2:
+            return {"status": "error", "message": "Could not query max clocks"}
+        plan = [["-lgc", f"{clocks[0]},{clocks[0]}"], ["-lmc", f"{clocks[1]},{clocks[1]}"]]
+        if level == "profile_peak":
+            limits = query("power.max_limit")
+            if limits:
+                plan.append(["-pl", watts(limits[0])])
+    elif level == "low":
+        res = smi("--query-supported-clocks=graphics", "--format=csv,noheader,nounits")
+        if res.returncode != 0 or not res.stdout.strip():
+            return {"status": "error", "message": "Could not query supported clocks"}
+        min_clock = res.stdout.strip().splitlines()[-1].strip()
+        plan = [["-rmc"], ["-lgc", f"{min_clock},{min_clock}"]]
+        limits = query("power.min_limit")
+        if limits:
+            plan.append(["-pl", watts(limits[0])])
+
+    failures = []
+    for cmd in plan:
+        res = smi(*cmd)
+        if res.returncode != 0:
+            failures.append(f"{cmd[0]}: {(res.stderr or res.stdout).strip()}")
+    if failures:
+        return {"status": "error", "message": "; ".join(failures)[:300]}
+    return {"status": "success", "level": level, "method": "nvidia-smi"}
+
+LEVELS = {"auto", "low", "high", "profile_peak", "manual", "profile_standard", "profile_min_sclk", "profile_min_mclk"}
+
+def control(args):
+    if args == ["--check"]:
+        return {"status": "success", "euid": os.geteuid(), "helper": "omagpu-control"}
+    if len(args) != 3:
+        raise ValueError("Expected an action, GPU ID, and value")
+    action, card, value = args
+    if action not in {"--set-power-profile", "--set-fan"}:
+        raise ValueError("Unsupported action")
+    if not re.fullmatch(r"(?:card|nvidia)[0-9]{1,3}", card):
+        raise ValueError("Invalid GPU ID")
+    if action == "--set-power-profile" and value not in LEVELS:
+        raise ValueError("Invalid power profile")
+    if action == "--set-fan" and value != "auto":
+        if not re.fullmatch(r"[0-9]{1,3}", value) or not 0 <= int(value) <= 255:
+            raise ValueError("Fan PWM must be auto or 0 through 255")
+    if os.geteuid() != 0:
+        raise PermissionError("Root privileges required")
+    target = nvidia_control_target(card)
+    if target:
+        if action == "--set-power-profile":
+            return set_nvidia_performance(card, target, value)
+        result = set_nvidia_fan(target, value)
+        return result or {"status": "error", "message": "Driver denied fan control"}
+    if get_driver(card) != "amdgpu":
+        raise ValueError("GPU does not expose supported controls")
+    device = Path("/sys/class/drm") / card / "device"
+    if action == "--set-power-profile":
+        (device / "power_dpm_force_performance_level").write_text(value)
+        return {"status": "success", "level": value, "method": "direct"}
+    monitors = sorted((device / "hwmon").glob("hwmon[0-9]*"))
+    if not monitors:
+        raise ValueError("No GPU fan controller found")
+    pwm = monitors[0] / "pwm1"
+    enable = monitors[0] / "pwm1_enable"
+    if not pwm.exists() or not enable.exists():
+        raise ValueError("No writable fan control exposed")
+    if value == "auto":
+        enable.write_text("2")
+        return {"status": "success", "mode": "auto", "method": "direct"}
+    enable.write_text("1")
+    pwm.write_text(str(int(value)))
+    return {"status": "success", "pwm": int(value), "method": "direct"}
+
+if __name__ == "__main__":
+    try:
+        result = control(sys.argv[1:])
+    except Exception as exc:
+        result = {"status": "error", "message": str(exc)[:300]}
+    print(json.dumps(result))
+    sys.exit(0 if result.get("status") == "success" else 1)
