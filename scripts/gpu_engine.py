@@ -9,6 +9,7 @@ import sys
 import os
 import re
 import json
+import math
 import time
 import ctypes
 import subprocess
@@ -107,7 +108,7 @@ def parse_nvidia_smi_output(raw_output):
         vram_pct = round((used_mb / total_mb) * 100, 1) if total_mb > 0 else 0.0
 
         core_temp = parse_optional_float(values["temperature.gpu"])
-        hotspot_temp = round(core_temp + 8.0, 1) if core_temp is not None else None
+        hotspot_temp = None  # NVIDIA does not expose hotspot temperature here.
         fan_speed = parse_optional_int(values["fan.speed"])
 
         cur_gen = values.get("pcie.link.gen.current", "4")
@@ -127,6 +128,8 @@ def parse_nvidia_smi_output(raw_output):
             "isPrimary": idx == 0,
             "supportsTuning": True,
             "supportsFanControl": fan_speed is not None,
+            "clocks": {"graphicsMHz": parse_optional_int(values["clocks.current.graphics"]),
+                       "memoryMHz": parse_optional_int(values["clocks.current.memory"])},
             "pcie": pcie_info,
             "rebar": True,
             "vram": {
@@ -146,12 +149,39 @@ def parse_nvidia_smi_output(raw_output):
                 "powerCapWatts": parse_optional_float(values["power.limit"]),
             },
             "tuning": {
-                "performanceLevel": "auto",
-                "activeProfile": "Auto (Dynamic)",
-                "fanControlMode": "Automatic (NVIDIA)",
+                "performanceLevel": "unknown",
+                "activeProfile": "Driver managed / unreported",
+                "fanControlMode": "Driver mode unreported",
             },
         })
 
+    return gpus
+
+
+def power_control_available():
+    try:
+        result = subprocess.run(["/usr/local/libexec/omagpu-control", "--check"],
+                                capture_output=True, text=True, timeout=2.0)
+        return result.returncode == 0 and json.loads(result.stdout).get("powerLimit") is True
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def attach_power_limits(gpus, output):
+    """Attach only complete, numeric driver-reported limits."""
+    for row in output.splitlines():
+        values = [part.strip() for part in row.split(",")]
+        if len(values) != 4 or not values[0].isdigit():
+            continue
+        limits = [parse_optional_float(value) for value in values[1:]]
+        if any(value is None or not math.isfinite(value) for value in limits):
+            continue
+        minimum, maximum, default = limits
+        if not 0 < minimum <= default <= maximum:
+            continue
+        for gpu in gpus:
+            if gpu["index"] == int(values[0]):
+                gpu["powerLimits"] = {"min": minimum, "max": maximum, "default": default}
     return gpus
 
 
@@ -168,7 +198,19 @@ def query_nvidia_gpus():
             timeout=2.0,
         )
         if result.returncode == 0:
-            return parse_nvidia_smi_output(result.stdout)
+            gpus = parse_nvidia_smi_output(result.stdout)
+            try:
+                limits = subprocess.run(
+                    ["/usr/bin/nvidia-smi", "--query-gpu=index,power.min_limit,power.max_limit,power.default_limit",
+                     "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2.0)
+                if limits.returncode == 0:
+                    attach_power_limits(gpus, limits.stdout)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            available = power_control_available()
+            for gpu in gpus:
+                gpu["supportsPowerLimit"] = available and "powerLimits" in gpu
+            return gpus
     except (FileNotFoundError, subprocess.SubprocessError):
         pass
     return []
@@ -495,7 +537,7 @@ def run_self_pkexec(*args):
             text=True,
             timeout=90
         )
-        if res.returncode == 0 and res.stdout.strip():
+        if res.stdout.strip():
             return json.loads(res.stdout.strip())
         if res.returncode in (126, 127):
             return {"status": "error", "message": "Authentication cancelled"}
@@ -692,18 +734,8 @@ def set_fan_pwm(card_id, pwm_val):
 def main():
     if len(sys.argv) > 1:
         action = sys.argv[1]
-        if action in {"--set-power-profile", "--set-fan"}:
+        if action in {"--set-power-profile", "--set-fan", "--set-power-limit"}:
             print(json.dumps(run_self_pkexec(*sys.argv[1:])))
-            return
-        if action == "--set-power-profile" and len(sys.argv) > 3:
-            card_id = sys.argv[2]
-            level = sys.argv[3]
-            print(json.dumps(set_performance_level(card_id, level)))
-            return
-        elif action == "--set-fan" and len(sys.argv) > 3:
-            card_id = sys.argv[2]
-            pwm = sys.argv[3]
-            print(json.dumps(set_fan_pwm(card_id, pwm)))
             return
 
     gpus = scan_gpus()

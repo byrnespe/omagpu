@@ -1,9 +1,10 @@
 # Local passwordless OmaGPU controls
 
 This setup grants user `org`, in an active local desktop session, passwordless
-access to OmaGPU power-profile and fan controls through a bounded root-owned
+access to OmaGPU power-profile, fan and bounded NVIDIA power-limit controls through a bounded root-owned
 helper. Other users and inactive or remote sessions retain administrator
-authentication. The helper validates GPU IDs, actions, profiles and PWM values;
+authentication. The helper validates GPU IDs, actions, profiles, PWM values and wattage against
+driver-reported power limits;
 it never executes user-provided shell commands or imports the writable plugin.
 
 The plugin routes tuning actions through `/usr/bin/pkexec` and
@@ -49,3 +50,12 @@ The helper remains available through normal administrator authentication.
 To remove the helper and action as well, first restore the plugin's original
 tuning dispatch; otherwise tuning actions will fail. Plugin updates may replace
 the local dispatch change; this commit records the integration and policy files.
+
+## Experimental controls
+
+The experimental panel adds custom fan duty, power-limit presets and a slider,
+quick power profiles, live-poll pause/rate controls, report copying, and command
+progress/error feedback. Power-limit actions stay disabled until the installed
+helper reports `powerLimit: true` from `--check`; installing a newer plugin
+alone does not expand root privileges. The updated helper requires explicit
+approval before installation. Current GPU settings are never changed on open.

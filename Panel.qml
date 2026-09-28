@@ -39,6 +39,55 @@ Panel {
   property bool isUpdating: false
   property string activeTab: "telemetry"
   property string copiedNotice: ""
+  property bool paused: false
+  property int refreshInterval: 2500
+  property string pendingAction: ""
+  property string controlOutput: ""
+  property string controlError: ""
+  property string pendingGpuId: ""
+  property var lastApplied: ({})
+  readonly property bool controlBusy: controlProc.running || pendingAction !== ""
+  readonly property var powerLimits: currentGpu.powerLimits || ({})
+  readonly property bool hasPowerRange: powerLimits.min !== undefined && powerLimits.max > powerLimits.min
+  readonly property bool canSetPower: hasPowerRange && currentGpu.supportsPowerLimit === true
+  readonly property string lastAppliedText: currentGpu.id ? (lastApplied[currentGpu.id] || "") : ""
+
+  function showNotice(message) {
+    root.copiedNotice = message
+    noticeTimer.restart()
+  }
+
+  function runControl(action, value, label) {
+    if (controlBusy || !currentGpu || !currentGpu.id) return
+    root.pendingAction = label
+    root.pendingGpuId = currentGpu.id
+    root.controlOutput = ""
+    root.controlError = ""
+    noticeTimer.stop()
+    root.copiedNotice = "Applying " + label + "…"
+    controlProc.command = ["/usr/bin/python3", Qt.resolvedUrl("scripts/gpu_engine.py").toString().replace(/^file:\/\//, ""), action, currentGpu.id, String(value)]
+    controlProc.running = true
+  }
+
+  function setPowerLimit(value) {
+    runControl("--set-power-limit", value, value === "default" ? "default power limit" : value + " W power limit")
+  }
+
+  function copyReport() {
+    copyToClipboard(JSON.stringify({gpu: currentGpu, timestamp: lastUpdateTime}, null, 2))
+    showNotice("GPU report copied")
+  }
+
+  function syncSliders() {
+    if (powerSlider && !powerSlider.pressed)
+      powerSlider.value = currentGpu.thermal && currentGpu.thermal.powerCapWatts !== null
+        ? currentGpu.thermal.powerCapWatts : (powerLimits.default || 0)
+    if (fanSlider && !fanSlider.pressed)
+      fanSlider.value = currentGpu.thermal && currentGpu.thermal.fanPwmPercent !== null
+        ? currentGpu.thermal.fanPwmPercent : 50
+  }
+
+  onSelectedGpuIndexChanged: Qt.callLater(root.syncSliders)
 
   readonly property var tabList: [
     { label: "Telemetry", key: "telemetry" },
@@ -80,15 +129,11 @@ Panel {
   }
 
   function setPowerProfile(level) {
-    if (!currentGpu || !currentGpu.id) return
-    controlProc.command = ["python3", Qt.resolvedUrl("scripts/gpu_engine.py").toString().replace(/^file:\/\//, ""), "--set-power-profile", currentGpu.id, level]
-    controlProc.running = true
+    runControl("--set-power-profile", level, "power profile: " + level)
   }
 
   function setFanPwm(pwmVal) {
-    if (!currentGpu || !currentGpu.id) return
-    controlProc.command = ["python3", Qt.resolvedUrl("scripts/gpu_engine.py").toString().replace(/^file:\/\//, ""), "--set-fan", currentGpu.id, pwmVal.toString()]
-    controlProc.running = true
+    runControl("--set-fan", pwmVal, pwmVal === "auto" ? "automatic fan control" : Math.round(Number(pwmVal) / 255 * 100) + "% fan duty")
   }
 
   function parseGpuOutput(text) {
@@ -96,7 +141,9 @@ Panel {
     if (!text || text.trim() === "") return
     try {
       var data = JSON.parse(text)
+      var firstLoad = root.gpus.length === 0
       root.gpus = data.gpus || []
+      if (firstLoad) Qt.callLater(root.syncSliders)
       if (root.selectedGpuIndex >= root.gpus.length) root.selectedGpuIndex = 0
       if (data.histories) {
         root.histories = data.histories
@@ -117,15 +164,15 @@ Panel {
 
   Timer {
     id: liveTimer
-    interval: 2500
-    running: root.opened
+    interval: root.refreshInterval
+    running: root.opened && !root.paused
     repeat: true
     onTriggered: root.refresh()
   }
 
   Timer {
     id: noticeTimer
-    interval: 2500
+    interval: 8000
     running: false
     repeat: false
     onTriggered: root.copiedNotice = ""
@@ -149,25 +196,30 @@ Panel {
     id: controlProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        if (text && text.trim() !== "") {
-          try {
-            var res = JSON.parse(text)
-            if (res.status === "success") {
-              if (res.level) root.copiedNotice = "Applied Power Governor: " + res.level
-              else if (res.mode === "auto") root.copiedNotice = "Fan mode set to: Automatic VBIOS"
-              else if (res.pwm !== undefined) root.copiedNotice = "Fan speed set to PWM: " + res.pwm
-              noticeTimer.restart()
-            } else if (res.status === "error") {
-              root.copiedNotice = "Tuning Error: " + (res.message || "Permission denied")
-              noticeTimer.restart()
-            }
-          } catch (e) {
-            console.log("controlProc parse error:", e)
+      onStreamFinished: root.controlOutput = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.controlError = text
+    }
+    onExited: function(exitCode) {
+      Qt.callLater(function() {
+        try {
+          var result = JSON.parse(root.controlOutput)
+          if (result.status === "success" && exitCode === 0) {
+            var applied = Object.assign({}, root.lastApplied)
+            applied[root.pendingGpuId] = root.pendingAction
+            root.lastApplied = applied
+            root.showNotice(result.pwm !== undefined ? "Fan command applied; live duty reflects driver limits." : "Applied " + root.pendingAction)
+          } else {
+            root.showNotice("Could not apply: " + (result.message || root.controlError || "Unknown error"))
           }
+        } catch (error) {
+          root.showNotice("Could not apply: " + (root.controlError.trim() || "No response from GPU controller"))
         }
+        root.pendingAction = ""
         root.refresh()
-      }
+      })
     }
   }
 
@@ -208,6 +260,8 @@ Panel {
       }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "p" || t === "P") { root.paused = !root.paused; if (!root.paused) root.refresh() }
+        else if (["1", "2", "3", "4"].indexOf(t) >= 0) root.activeTab = root.tabList[Number(t) - 1].key
         else if (t === "[") root.selectGpu(-1)
         else if (t === "]") root.selectGpu(1)
       }
@@ -322,6 +376,15 @@ Panel {
             }
           }
 
+          Flow {
+            width: parent.width
+            spacing: Style.space(6)
+            ControlButton { text: root.paused ? "Resume live" : "Pause live"; onClicked: { root.paused = !root.paused; if (!root.paused) root.refresh() } }
+            ControlButton { text: "Refresh"; enabled: !root.isUpdating; onClicked: root.refresh() }
+            ControlButton { text: "Copy report"; enabled: !!currentGpu.id; onClicked: root.copyReport() }
+            ControlButton { text: "Poll: " + (root.refreshInterval / 1000) + "s"; onClicked: root.refreshInterval = root.refreshInterval === 1000 ? 2500 : root.refreshInterval === 2500 ? 5000 : 1000 }
+          }
+
           // ------------------ GPU DEVICE SWITCHER ------------------
           Row {
             id: gpuSelectorRow
@@ -373,6 +436,7 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
+                  enabled: !root.controlBusy
                   onClicked: root.selectedGpuIndex = index
                 }
               }
@@ -392,6 +456,8 @@ Panel {
               id: noticeText
               textFormat: Text.PlainText
               anchors.centerIn: parent
+              width: parent.width - Style.space(16)
+              wrapMode: Text.Wrap
               text: root.copiedNotice
               color: Color.accent
               font.family: root.fontFamily
@@ -806,6 +872,67 @@ Panel {
               wrapMode: Text.Wrap
             }
 
+            Flow {
+              width: parent.width
+              spacing: Style.space(6)
+              enabled: Boolean(currentGpu.supportsTuning) && !root.controlBusy
+              ControlButton { text: "Balanced"; onClicked: root.setPowerProfile("auto") }
+              ControlButton { text: "Low power"; onClicked: root.setPowerProfile("low") }
+              ControlButton { text: "Performance"; onClicked: root.setPowerProfile("high") }
+            }
+
+            Text {
+              visible: root.lastAppliedText !== ""
+              width: parent.width
+              text: "Last applied here: " + root.lastAppliedText
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Column {
+              visible: root.hasPowerRange
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                text: "Power limit · " + root.metricText(currentGpu.thermal ? currentGpu.thermal.powerCapWatts : null, " W") + " current"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                text: "Driver range " + root.powerLimits.min + "–" + root.powerLimits.max + " W · Default " + root.powerLimits.default + " W" + (root.canSetPower ? "" : "\nPower-limit control is not enabled yet.")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              Slider {
+                id: powerSlider
+                width: parent.width
+                from: root.powerLimits.min || 0
+                to: root.powerLimits.max || 1
+                stepSize: 1
+                snapMode: Slider.SnapAlways
+                enabled: root.canSetPower && !root.controlBusy
+                Accessible.name: "GPU power limit in watts"
+              }
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
+                enabled: root.canSetPower && !root.controlBusy
+                ControlButton { text: "Apply " + Math.round(powerSlider.value) + " W"; accent: true; onClicked: root.setPowerLimit(Math.round(powerSlider.value)) }
+                ControlButton { text: "Minimum"; onClicked: root.setPowerLimit(root.powerLimits.min) }
+                ControlButton { text: "Midpoint"; onClicked: root.setPowerLimit(Math.round((root.powerLimits.min + root.powerLimits.max) / 2)) }
+                ControlButton { text: "Default"; onClicked: root.setPowerLimit("default") }
+                ControlButton { text: "Read current"; onClicked: root.syncSliders() }
+              }
+            }
+
             // Unsupported GPU notice card
             BorderSurface {
               visible: !Boolean(currentGpu.supportsTuning)
@@ -890,6 +1017,7 @@ Panel {
 
                 PanelActionButton {
                   id: applyBtn
+                  enabled: !root.controlBusy
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
@@ -955,6 +1083,46 @@ Panel {
               }
             }
 
+            Column {
+              visible: Boolean(currentGpu.supportsFanControl)
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                text: "Custom fan duty · " + Math.round(fanSlider.value) + "%"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Slider {
+                id: fanSlider
+                width: parent.width
+                from: 0
+                to: 100
+                value: 50
+                stepSize: 1
+                snapMode: Slider.SnapAlways
+                enabled: !root.controlBusy
+                Accessible.name: "GPU fan duty percentage"
+              }
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
+                enabled: !root.controlBusy
+                ControlButton { text: "Apply " + Math.round(fanSlider.value) + "%"; accent: true; onClicked: root.setFanPwm(Math.round(fanSlider.value * 255 / 100)) }
+                ControlButton { text: "Automatic"; onClicked: root.setFanPwm("auto") }
+                ControlButton { text: "Read current"; onClicked: root.syncSliders() }
+              }
+              Text {
+                width: parent.width
+                text: "Driver fan limits apply. Automatic returns control to the GPU firmware."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+            }
+
             // Fan Speed Presets Grid
             Grid {
               visible: Boolean(currentGpu.supportsFanControl)
@@ -965,7 +1133,7 @@ Panel {
               Repeater {
                 model: [
                   { label: "Automatic VBIOS", pwm: "auto", desc: "Hardware firmware manages fan curve dynamically based on thermal sensors." },
-                  { label: "35% Silent", pwm: "90", desc: "Quiet desktop mode with inaudible acoustic profile." },
+                  { label: "35% Silent", pwm: "90", desc: "Fixed low fan duty; actual noise depends on your GPU." },
                   { label: "60% Balanced", pwm: "153", desc: "Steady airflow with balanced acoustics for light gaming." },
                   { label: "80% Aggressive", pwm: "204", desc: "High airflow for heavy 3D rendering and long gaming sessions." },
                   { label: "100% Maximum", pwm: "255", desc: "Full 255 PWM duty cycle for maximum thermal dissipation." }
@@ -1008,6 +1176,7 @@ Panel {
                     PanelActionButton {
                       anchors.right: parent.right
                       iconText: "󰈐"
+                      enabled: !root.controlBusy
                       tooltipText: "Set " + modelData.label
                       foreground: Color.accent
                       onClicked: root.setFanPwm(modelData.pwm)
@@ -1167,9 +1336,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: root.gpus.length > 1
-              ? "Tip: Choose a GPU above or use '[' and ']' · Press 'R' to refresh"
-              : "Tip: Press 'R' to refresh · Click any power or fan preset to apply tuning instantly"
+            text: "1–4: tabs · R: refresh · P: pause" + (root.gpus.length > 1 ? " · [ / ]: GPU" : "")
             color: Qt.darker(root.dim, 1.3)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
